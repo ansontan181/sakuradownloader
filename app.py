@@ -1,318 +1,328 @@
 # app.py
 import os
+import re
+import csv
 import sys
-import shutil
-import subprocess
+import json
+import time
 import uuid
+import queue
+import shutil
+import zipfile
+import threading
+import subprocess
 from pathlib import Path
-from datetime import datetime
-from flask import (
-    Flask, request, send_file, send_from_directory,
-    jsonify, Response, url_for
-)
+from typing import Dict, Any, Optional, Iterable
 
-# ========= 基本路径 =========
-BASE_DIR    = Path(__file__).resolve().parent
-URLS_TXT    = BASE_DIR / "urls.txt"
-RESULT_CSV  = BASE_DIR / "m3u8_results.csv"
-SCRIPT_PY   = BASE_DIR / "grab_m3u8.py"          # 你的 m3u8 抓取脚本
-PS1_PATH    = BASE_DIR / "download_from_csv.ps1" # 你的 PowerShell 下载器
-DOWNLOADS   = BASE_DIR / "downloads"             # 统一下载根目录
-DOWNLOADS.mkdir(exist_ok=True)
+from flask import Flask, request, jsonify, Response, send_file
+from flask_cors import CORS
 
-# 任务表（非常简单的内存实现）
-JOBS = {}  # job_id -> {"urls": str, "artifact": Path|None}
+# -------------------------
+# 基础配置
+# -------------------------
+BASE_DIR = Path(__file__).resolve().parent
+JOBS_DIR = BASE_DIR / "jobs"
+JOBS_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
+# 允许所有来源跨域（也可以替换为你的 GitHub Pages 源域名）
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 
-# ========= 工具函数 =========
-def _run_grabber():
-    """运行 grab_m3u8.py 生成 m3u8_results.csv，返回 (ok, log_text)。"""
-    if not SCRIPT_PY.exists():
-        return False, f"找不到脚本：{SCRIPT_PY}"
-    # 清理旧结果
-    if RESULT_CSV.exists():
-        try:
-            RESULT_CSV.unlink()
-        except Exception:
-            pass
+@app.after_request
+def add_cors_headers(resp):
+    """统一给响应补充 CORS 头以及允许预检。"""
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT_PY)],
-        cwd=str(BASE_DIR),
+
+# -------------------------
+# 简单的任务管理（内存 + 文件夹）
+# -------------------------
+class JobState:
+    def __init__(self, job_id: str, workdir: Path):
+        self.job_id = job_id
+        self.workdir = workdir
+        self.log_q: "queue.Queue[str]" = queue.Queue()
+        self.done = False
+        self.artifact: Optional[Path] = None  # mp4 或 zip 文件路径
+
+    def log(self, msg: str):
+        # 同时打印到容器日志 & 放到 SSE
+        line = msg.rstrip("\n")
+        print(line, flush=True)
+        self.log_q.put(line)
+
+
+JOBS: Dict[str, JobState] = {}
+
+
+def sanitize_filename(name: str) -> str:
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", name or "").strip().strip(".")
+    return safe or "video"
+
+
+def run_and_stream(cmd: list, job: JobState, cwd: Path = None):
+    """运行子进程并把输出实时写到日志队列。"""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=60 * 30
+        bufsize=1,
+        universal_newlines=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
-    if proc.returncode != 0:
-        return False, proc.stdout
-    if not RESULT_CSV.exists():
-        return False, "脚本运行后未发现 m3u8_results.csv"
-    return True, proc.stdout
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        job.log(line.rstrip("\n"))
+    returncode = proc.wait()
+    if returncode != 0:
+        job.log(f"[ERROR] command failed ({returncode}): {' '.join(cmd)}")
+    return returncode
 
 
-def _run_ps1(csv_path: Path, out_dir: Path):
-    """
-    运行 PowerShell 下载器。
-    优先尝试：-CsvPath -OutDir；失败则退化为仅 -CsvPath 并把新 MP4 挪到 out_dir。
-    返回 (ok, log_text, produced_files[List[Path]])
-    """
-    if not PS1_PATH.exists():
-        return False, f"找不到 PowerShell 脚本：{PS1_PATH}", []
+def read_m3u8_csv(csv_path: Path) -> list[dict]:
+    rows = []
+    if not csv_path.exists():
+        return rows
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    return rows
 
-    before = set(p.resolve() for p in BASE_DIR.glob("*.mp4"))
 
-    # 方案 A：带 -OutDir（推荐）
-    cmd_a = [
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", str(PS1_PATH),
-        "-CsvPath", str(csv_path),
-        "-OutDir", str(out_dir)
+def download_with_ffmpeg(row: dict, out_dir: Path, job: JobState) -> Optional[Path]:
+    """按你的 PowerShell 脚本逻辑下载一个 m3u8 为 mp4。"""
+    title = row.get("title") or "video"
+    m3u8 = (row.get("m3u8_url") or "").strip()
+    page_url = (row.get("page_url") or "").strip()
+    ref = (row.get("referer") or "").strip() or page_url
+    ua = (row.get("user_agent") or "").strip() or "Mozilla/5.0"
+
+    if not m3u8:
+        job.log("[WARN] skip: empty m3u8_url")
+        return None
+
+    # 展开 '?vid=真实m3u8'
+    m = re.search(r"\?vid=(https?[^&\s]+)", m3u8)
+    if m:
+        m3u8 = m.group(1)
+
+    # URL 解码
+    try:
+        from urllib.parse import unquote
+        m3u8 = unquote(m3u8)
+    except Exception:
+        pass
+
+    # 只取第一个 .m3u8 真实地址（去掉多余尾巴）
+    m = re.search(r"https?://[^\"'\s]+?\.m3u8", m3u8)
+    if m:
+        m3u8 = m.group(0)
+
+    out_base = sanitize_filename(title)
+    out = out_dir / f"{out_base}.mp4"
+    n = 1
+    while out.exists():
+        out = out_dir / f"{out_base}_{n}.mp4"
+        n += 1
+
+    job.log(f"[downloading] {title}")
+    job.log(f"      m3u8 url : {m3u8}")
+    job.log(f"      output   : {out.name}")
+
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-headers", f"User-Agent: {ua}",
+        "-headers", f"Referer: {ref}",
+        "-i", m3u8,
+        "-c", "copy",
+        str(out),
     ]
-    proc_a = subprocess.run(
-        cmd_a, cwd=str(BASE_DIR),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        timeout=60 * 60
-    )
-    if proc_a.returncode == 0:
-        files = list(out_dir.glob("*.mp4"))
-        if files:
-            return True, proc_a.stdout, files
-        # 兜底：如果仍落在当前目录
-        more = []
-        for f in BASE_DIR.glob("*.mp4"):
-            if f.resolve() not in before:
-                dst = out_dir / f.name
-                try:
-                    shutil.move(str(f), dst)
-                    more.append(dst)
-                except Exception:
-                    pass
-        if more:
-            return True, proc_a.stdout, more
-        log_acc = "[Info] -OutDir 模式未发现文件，尝试仅 -CsvPath。\n" + proc_a.stdout
-    else:
-        log_acc = "[Info] -OutDir 模式执行失败，尝试仅 -CsvPath。\n" + proc_a.stdout
+    rc = run_and_stream(args, job, cwd=out_dir)
+    if rc != 0:
+        job.log(f"[WARN] failed : {title}")
+        return None
 
-    # 方案 B：仅 -CsvPath
-    cmd_b = [
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", str(PS1_PATH),
-        "-CsvPath", str(csv_path)
-    ]
-    proc_b = subprocess.run(
-        cmd_b, cwd=str(BASE_DIR),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        timeout=60 * 60
-    )
-    if proc_b.returncode != 0:
-        return False, (log_acc + "\n" + proc_b.stdout), []
-
-    produced = []
-    for f in BASE_DIR.glob("*.mp4"):
-        if f.resolve() not in before:
-            dst = out_dir / f.name
-            try:
-                shutil.move(str(f), dst)
-                produced.append(dst)
-            except Exception:
-                pass
-    return (True, log_acc + "\n" + proc_b.stdout, produced)
-
-
-def _zip_dir(dir_path: Path):
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_base = BASE_DIR / f"downloads_{stamp}"
-    zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=str(dir_path))
-    return Path(zip_path)
-
-
-# ========= 页面与原有三个接口 =========
-@app.route("/", methods=["GET"])
-def index():
-    return send_from_directory(str(BASE_DIR), "index.html")
-
-
-@app.route("/run", methods=["POST"])
-def run_only():
-    """只抓 m3u8：可接收 urls（覆盖 urls.txt），运行抓取脚本并返回 CSV。"""
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        raw_urls = (data.get("urls") or "").strip()
-        if raw_urls:
-            URLS_TXT.write_text(raw_urls + "\n", encoding="utf-8")
-        elif not URLS_TXT.exists():
-            return ("缺少 urls.txt 或请求体未提供 urls。", 400)
-
-        ok, log = _run_grabber()
-        if not ok:
-            return (f"抓取失败：\n{log}", 500)
-
-        return send_file(
-            RESULT_CSV,
-            mimetype="text/csv; charset=utf-8",
-            as_attachment=True,
-            download_name="m3u8_results.csv"
-        )
-    except subprocess.TimeoutExpired:
-        return ("执行超时，请减少链接数量或放宽超时。", 500)
-    except Exception as e:
-        return (f"服务器异常：{e}", 500)
+        size = out.stat().st_size
+        if size < 5_000_000:
+            job.log(f"[WARN] small : {out.name} ({size} Bytes)")
+        else:
+            job.log(f"[OK] done   : {out.name} ({size} Bytes)")
+    except FileNotFoundError:
+        job.log(f"[WARN] not found after ffmpeg : {out.name}")
+        return None
+    return out
 
 
-@app.route("/download", methods=["POST"])
-def download_from_csv():
-    """根据现有 CSV 下载 MP4（调用 PS1），完成后打包 ZIP 或返回单 MP4。"""
+def pack_zip(files: list[Path], dest_zip: Path):
+    with zipfile.ZipFile(dest_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in files:
+            z.write(p, arcname=p.name)
+
+
+def worker(job: JobState, urls_text: str):
+    """后台线程：写入 urls.txt → 执行 grab_m3u8.py → 按 CSV 下载 MP4 → 产出单文件或 ZIP。"""
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        csv_path = Path(data.get("csv_path") or RESULT_CSV)
-        if not csv_path.exists():
-            return (f"找不到 CSV：{csv_path}，请先抓取。", 400)
+        workdir = job.workdir
+        workdir.mkdir(parents=True, exist_ok=True)
+        urls_txt = workdir / "urls.txt"
+        urls_txt.write_text(urls_text.strip() + "\n", encoding="utf-8")
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = DOWNLOADS / f"sess_{stamp}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        job.log("任务已创建，开始抓取 m3u8 ...")
 
-        ok, log, files = _run_ps1(csv_path, out_dir)
-        if not ok:
-            return (f"下载器执行失败：\n{log}", 500)
-        if not files:
-            return (f"下载完成，但未找到 MP4 文件。\n日志：\n{log}", 200)
+        # 运行你的抓取脚本（在工作目录中）
+        # 该脚本会输出 m3u8_results.csv
+        cmd = [sys.executable, str(BASE_DIR / "grab_m3u8.py")]
+        rc = run_and_stream(cmd, job, cwd=workdir)
+        if rc != 0:
+            job.log("[ERROR] 抓取 m3u8 脚本执行失败，请检查日志。")
+            job.done = True
+            return
 
-        if len(files) == 1:
-            return send_file(files[0], as_attachment=True, download_name=files[0].name, mimetype="video/mp4")
-        zip_path = _zip_dir(out_dir)
-        return send_file(zip_path, as_attachment=True, download_name=zip_path.name, mimetype="application/zip")
+        csv_path = workdir / "m3u8_results.csv"
+        rows = read_m3u8_csv(csv_path)
+        job.log(f"[DONE] 共写入 {len(rows)} 条到 m3u8_results.csv")
+        if not rows:
+            job.log("[ERROR] 未发现可下载的 m3u8 结果。")
+            job.done = True
+            return
 
-    except subprocess.TimeoutExpired:
-        return ("下载过程超时，请减少并发或分批下载。", 500)
+        job.log("开始下载 MP4（ffmpeg）...")
+        out_dir = workdir / "outputs"
+        out_dir.mkdir(exist_ok=True)
+
+        produced: list[Path] = []
+        for i, row in enumerate(rows, 1):
+            job.log(f"[{i}/{len(rows)}] processing ...")
+            p = download_with_ffmpeg(row, out_dir, job)
+            if p:
+                produced.append(p)
+
+        if not produced:
+            job.log("[ERROR] 全部下载失败。")
+            job.done = True
+            return
+
+        if len(produced) == 1:
+            job.artifact = produced[0]
+            job.log(f"[FINAL] 产物：{job.artifact.name}")
+        else:
+            dest_zip = workdir / "videos.zip"
+            pack_zip(produced, dest_zip)
+            job.artifact = dest_zip
+            job.log(f"[FINAL] 产物：{job.artifact.name}")
+
     except Exception as e:
-        return (f"服务器异常：{e}", 500)
+        job.log(f"[FATAL] {type(e).__name__}: {e}")
+    finally:
+        job.done = True
 
 
-@app.route("/oneclick", methods=["POST"])
-def oneclick():
-    """同步版：一键抓 m3u8 + 下载，直接返回文件。"""
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        raw_urls = (data.get("urls") or "").strip()
-        if not raw_urls:
-            return ("请粘贴至少一个链接（每行一个）", 400)
-        URLS_TXT.write_text(raw_urls + "\n", encoding="utf-8")
-
-        ok, log = _run_grabber()
-        if not ok:
-            return (f"抓取失败：\n{log}", 500)
-
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = DOWNLOADS / f"sess_{stamp}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        ok2, log2, files = _run_ps1(RESULT_CSV, out_dir)
-        if not ok2:
-            return (f"下载失败：\n{log2}", 500)
-        if not files:
-            return (f"已完成，但未发现 MP4 文件。\n日志：\n{log2}", 200)
-
-        if len(files) == 1:
-            return send_file(files[0], as_attachment=True, download_name=files[0].name, mimetype="video/mp4")
-        zip_path = _zip_dir(out_dir)
-        return send_file(zip_path, as_attachment=True, download_name=zip_path.name, mimetype="application/zip")
-
-    except subprocess.TimeoutExpired:
-        return ("执行超时，请减少链接数量或分批处理。", 500)
-    except Exception as e:
-        return (f"服务器异常：{e}", 500)
-
-
-# ========= 新增：SSE 实时日志的一键流程 =========
-@app.route("/oneclick_start", methods=["POST"])
-def oneclick_start():
-    data = request.get_json(force=True, silent=True) or {}
-    raw_urls = (data.get("urls") or "").strip()
-    if not raw_urls:
-        return ("请粘贴至少一个链接（每行一个）", 400)
+def create_job(urls_text: str) -> JobState:
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"urls": raw_urls, "artifact": None}
-    return jsonify({"job_id": job_id})
+    workdir = JOBS_DIR / job_id
+    state = JobState(job_id, workdir)
+    JOBS[job_id] = state
+    threading.Thread(target=worker, args=(state, urls_text), daemon=True).start()
+    return state
 
 
-def _sse_line(text: str):
-    return f"data: {text}\n\n"
+def stream_logs(job: JobState) -> Iterable[str]:
+    """给 SSE 使用：不断从队列拿日志，直到任务 done 且队列清空。"""
+    # 心跳间隔，避免中间网络设备断流
+    HEARTBEAT_SEC = 12
+    last_beat = time.time()
 
-
-def _sse_event(event: str, data: str):
-    return f"event: {event}\n" + _sse_line(data)
-
-
-@app.route("/oneclick_stream/<job_id>", methods=["GET"])
-def oneclick_stream(job_id):
-    if job_id not in JOBS:
-        return ("未知 job_id", 404)
-    raw_urls = JOBS[job_id]["urls"]
-
-    def generate():
+    while True:
         try:
-            URLS_TXT.write_text(raw_urls + "\n", encoding="utf-8")
-            yield _sse_line("已接收链接，开始抓取 m3u8…")
+            line = job.log_q.get(timeout=0.5)
+            yield line
+        except queue.Empty:
+            pass
 
-            ok, log = _run_grabber()
-            yield _sse_line("抓取脚本输出：")
-            for line in (log or "").splitlines():
-                yield _sse_line("  " + line)
-            if not ok:
-                yield _sse_event("error", "抓取失败，已结束。")
-                return
+        # 发送心跳
+        now = time.time()
+        if now - last_beat >= HEARTBEAT_SEC:
+            yield "[heartbeat]"
+            last_beat = now
 
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = DOWNLOADS / f"sess_{stamp}_{job_id}"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            yield _sse_line("开始下载 MP4（ffmpeg）…")
-
-            ok2, log2, files = _run_ps1(RESULT_CSV, out_dir)
-            yield _sse_line("下载器输出：")
-            for line in (log2 or "").splitlines():
-                yield _sse_line("  " + line)
-
-            if not ok2:
-                yield _sse_event("error", "下载失败，已结束。")
-                return
-            if not files:
-                yield _sse_event("error", "未发现 MP4 文件，已结束。")
-                return
-
-            if len(files) == 1:
-                artifact = files[0]
-            else:
-                artifact = _zip_dir(out_dir)
-
-            JOBS[job_id]["artifact"] = artifact
-            dl_url = f"/artifact/{job_id}"
-            yield _sse_line("全部完成 ✅")
-            yield _sse_event("done", dl_url)
-        except Exception as e:
-            yield _sse_event("error", f"服务器异常：{e}")
-
-    return Response(generate(), mimetype="text/event-stream")
+        if job.done and job.log_q.empty():
+            break
 
 
-@app.route("/artifact/<job_id>", methods=["GET"])
-def artifact_download(job_id):
-    info = JOBS.get(job_id)
-    if not info or not info.get("artifact"):
-        return ("产物未就绪或 job_id 无效", 404)
-    f = info["artifact"]
-    mime = "application/zip" if f.suffix.lower() == ".zip" else "video/mp4"
-    return send_file(f, as_attachment=True, download_name=f.name, mimetype=mime)
+# -------------------------
+# 路由
+# -------------------------
+@app.route("/")
+def home():
+    return "Backend is running!"
+
+@app.route("/healthz")
+def healthz():
+    return "ok"
 
 
-@app.route("/last-log", methods=["GET"])
-def last_log():
-    return jsonify({"message": "未启用持久日志。如需日志，请在 /run 或 /download 中将日志写入文件保存。"})
+@app.route("/oneclick_start", methods=["POST", "OPTIONS"])
+def oneclick_start():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    urls = (data.get("urls") or "").strip()
+    if not urls:
+        return jsonify({"error": "empty urls"}), 400
+
+    job = create_job(urls)
+    return jsonify({"job_id": job.job_id})
 
 
+@app.route("/oneclick_stream/<job_id>")
+def oneclick_stream(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return Response("not found", status=404)
+
+    def gen():
+        # 实时日志
+        for line in stream_logs(job):
+            yield f"data: {line}\n\n"
+        # 完成事件（把下载地址告诉前端）
+        artifact_path = f"/artifact/{job.job_id}"
+        yield f"event: done\ndata: {artifact_path}\n\n"
+
+    headers = {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
+    }
+    return Response(gen(), headers=headers)
+
+
+@app.route("/artifact/<job_id>")
+def artifact(job_id: str):
+    job = JOBS.get(job_id)
+    if not job or not job.artifact or not job.artifact.exists():
+        return Response("not found", status=404)
+    # 触发浏览器下载
+    return send_file(
+        str(job.artifact),
+        as_attachment=True,
+        download_name=job.artifact.name
+    )
+
+
+# -------------------------
+# 本地调试入口（Render 用 gunicorn 启动）
+# -------------------------
 if __name__ == "__main__":
-    # 本地启动
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # 本地调试：python app.py
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=True)

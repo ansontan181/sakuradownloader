@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>樱花动漫下载器</title>
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js"></script>
+  <style>
+    body{font-family:sans-serif;background:#111;color:#eee;padding:20px;}
+    textarea{width:100%;height:100px;}
+    button{margin-top:10px;padding:8px 14px;}
+    pre{background:#222;padding:10px;height:200px;overflow:auto;}
+  </style>
+</head>
+<body>
+  <h1>m3u8 在线下载 (浏览器直接处理)</h1>
+  <p>输入 <b>m3u8 链接</b>（需允许 CORS）：</p>
+  <textarea id="url"></textarea><br>
+  <button onclick="download()">下载并合成 MP4</button>
+  <pre id="log"></pre>
+
+  <script>
+    const { createFFmpeg, fetchFile } = FFmpeg;
+    const ffmpeg = createFFmpeg({ log: true });
+
+    async function download() {
+      const url = document.getElementById('url').value.trim();
+      if (!url.endsWith('.m3u8')) {
+        alert('请输入正确的 m3u8 链接');
+        return;
+      }
+      const log = document.getElementById('log');
+      log.textContent = "正在加载 ffmpeg.wasm...\n";
+
+      if (!ffmpeg.isLoaded()) {
+        await ffmpeg.load();
+      }
+
+      log.textContent += "正在下载 m3u8 并处理...\n";
+
+      try {
+        // 把 m3u8 文件加载进虚拟 FS
+        const m3u8Data = await fetchFile(url);
+        ffmpeg.FS('writeFile', 'input.m3u8', m3u8Data);
+
+        // 执行 ffmpeg 合成
+        await ffmpeg.run('-protocol_whitelist', 'file,http,https,tcp,tls',
+                         '-i', 'input.m3u8', '-c', 'copy', 'output.mp4');
+
+        // 取结果
+        const data = ffmpeg.FS('readFile', 'output.mp4');
+        const blob = new Blob([data.buffer], { type: 'video/mp4' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = "video.mp4";
+        a.click();
+        URL.revokeObjectURL(a.href);
+
+        log.textContent += "✅ 完成！浏览器已触发下载。\n";
+      } catch (e) {
+        log.textContent += "❌ 出错: " + e + "\n";
+      }
+    }
+  </script>
+</body>
+</html>

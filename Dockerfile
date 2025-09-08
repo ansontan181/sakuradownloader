@@ -51,4 +51,4 @@ COPY . /app
 ENV PORT=10000
 
 # 使用 gunicorn 启动 Flask：app.py 内必须有 app = Flask(...)
-CMD ["sh", "-c", "gunicorn -b 0.0.0.0:${PORT:-10000} app:app"]
+CMD ["sh", "-c", "gunicorn -b 0.0.0.0:${PORT:-10000} --timeout 600 app:app"]

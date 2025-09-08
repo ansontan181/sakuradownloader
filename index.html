@@ -1,65 +1,100 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <title>樱花动漫下载器</title>
-  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js"></script>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>m3u8 一键下载</title>
   <style>
-    body{font-family:sans-serif;background:#111;color:#eee;padding:20px;}
-    textarea{width:100%;height:100px;}
-    button{margin-top:10px;padding:8px 14px;}
-    pre{background:#222;padding:10px;height:200px;overflow:auto;}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:24px;background:#0b1020;color:#e8ebff}
+    h1{font-size:20px;margin:0 0 12px}
+    .card{background:#121735;border:1px solid #283063;border-radius:14px;padding:16px;max-width:980px;margin:auto}
+    textarea{width:100%;min-height:200px;border:1px solid #39427f;background:#0f1430;color:#dbe1ff;border-radius:10px;padding:12px;font-size:14px}
+    .row{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+    button{border:0;background:#4c7dff;color:#fff;padding:10px 16px;border-radius:10px;font-weight:600;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    #log{margin-top:12px;padding:12px;background:#0f1430;border:1px solid #39427f;border-radius:10px;height:240px;overflow:auto;white-space:pre-wrap}
+    .hint{opacity:.8;font-size:13px;margin-top:8px}
   </style>
 </head>
 <body>
-  <h1>m3u8 在线下载 (浏览器直接处理)</h1>
-  <p>输入 <b>m3u8 链接</b>（需允许 CORS）：</p>
-  <textarea id="url"></textarea><br>
-  <button onclick="download()">下载并合成 MP4</button>
-  <pre id="log"></pre>
+  <div class="card">
+    <h1>m3u8 一键下载（Render 后端版）</h1>
+    <div class="hint">在下面粘贴<b>视频网页链接</b>（不是 m3u8）。后端会自动抓取 m3u8 并下载 MP4。</div>
 
-  <script>
-    const { createFFmpeg, fetchFile } = FFmpeg;
-    const ffmpeg = createFFmpeg({ log: true });
+    <textarea id="urls" placeholder="每行一个网页链接"></textarea>
 
-    async function download() {
-      const url = document.getElementById('url').value.trim();
-      if (!url.endsWith('.m3u8')) {
-        alert('请输入正确的 m3u8 链接');
-        return;
-      }
-      const log = document.getElementById('log');
-      log.textContent = "正在加载 ffmpeg.wasm...\n";
+    <div class="row">
+      <button id="go" onclick="start()">🚀 开始并显示进度</button>
+      <button id="dl" onclick="downloadResult()" disabled>下载结果</button>
+    </div>
 
-      if (!ffmpeg.isLoaded()) {
-        await ffmpeg.load();
-      }
+    <pre id="log"></pre>
+  </div>
 
-      log.textContent += "正在下载 m3u8 并处理...\n";
+<script>
+/** ←← 这里已替你填好 Render 域名 */
+const API_BASE = 'https://sakuradownloader-mo6n.onrender.com';
 
-      try {
-        // 把 m3u8 文件加载进虚拟 FS
-        const m3u8Data = await fetchFile(url);
-        ffmpeg.FS('writeFile', 'input.m3u8', m3u8Data);
+let es = null;
 
-        // 执行 ffmpeg 合成
-        await ffmpeg.run('-protocol_whitelist', 'file,http,https,tcp,tls',
-                         '-i', 'input.m3u8', '-c', 'copy', 'output.mp4');
+function log(msg){
+  const box = document.getElementById('log');
+  box.textContent += msg + '\n';
+  box.scrollTop = box.scrollHeight;
+}
+function setBtn(b, txt, dis){ b.innerText = txt; b.disabled = !!dis; }
 
-        // 取结果
-        const data = ffmpeg.FS('readFile', 'output.mp4');
-        const blob = new Blob([data.buffer], { type: 'video/mp4' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = "video.mp4";
-        a.click();
-        URL.revokeObjectURL(a.href);
+async function start(){
+  const btn = document.getElementById('go');
+  const dl  = document.getElementById('dl');
+  const urls = document.getElementById('urls').value.trim();
+  document.getElementById('log').textContent = '';
+  dl.disabled = true; dl.removeAttribute('data-href');
 
-        log.textContent += "✅ 完成！浏览器已触发下载。\n";
-      } catch (e) {
-        log.textContent += "❌ 出错: " + e + "\n";
-      }
+  if(!urls){ alert('请粘贴至少一个链接'); return; }
+
+  setBtn(btn, '处理中…', true);
+  try{
+    // 1) 创建任务
+    const res = await fetch(`${API_BASE}/oneclick_start`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ urls })
+    });
+    if(!res.ok){
+      log('创建任务失败：' + (await res.text()));
+      setBtn(btn, '🚀 开始并显示进度', false);
+      return;
     }
-  </script>
+    const { job_id } = await res.json();
+    log('任务创建成功：' + job_id);
+
+    // 2) 连接 SSE 日志流
+    es = new EventSource(`${API_BASE}/oneclick_stream/${job_id}`);
+    es.onmessage = (ev)=> log(ev.data);
+    es.addEventListener('done', (ev)=>{
+      const href = ev.data;  // 服务端返回形如 /artifact/<job_id>
+      log('✅ 完成，点击“下载结果”按钮。');
+      dl.dataset.href = href;
+      dl.disabled = false;
+      es.close();
+      setBtn(btn, '🚀 开始并显示进度', false);
+    });
+    es.addEventListener('error', ()=>{
+      log('❌ 流连接异常或被关闭');
+      try{ es.close(); }catch(_){}
+      setBtn(btn, '🚀 开始并显示进度', false);
+    });
+  }catch(e){
+    log('❌ 请求异常：' + e);
+    setBtn(btn, '🚀 开始并显示进度', false);
+  }
+}
+
+function downloadResult(){
+  const href = document.getElementById('dl').dataset.href;
+  if(!href){ alert('结果未就绪'); return; }
+  window.location.href = `${API_BASE}${href}`;
+}
+</script>
 </body>
 </html>
